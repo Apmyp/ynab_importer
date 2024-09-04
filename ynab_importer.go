@@ -16,14 +16,19 @@ func main() {
 	r := receiversFromDisk(ctx)
 	fr := filteredReceivers(ctx, r)
 	mf := messagesFiles(ctx, fr)
-	out := parsedMessages(ctx, mf)
+	rm := rawMessagesFromDisk(ctx, mf)
+	out := parsedMessages(ctx, rm)
 
 	for v := range out {
-		fmt.Println(v)
+		fmt.Println(v.operation_type, v.account, v.amount, v.location)
 	}
 }
 
 const receiversPath = "./messages"
+
+func allowedReceiver(receiver Receiver) bool {
+	return receiver.name == "102" // || receiver.name == "EXIMBANK"
+}
 
 type Receiver struct {
 	name string
@@ -75,10 +80,6 @@ func filteredReceivers(ctx context.Context, in <-chan Receiver) <-chan Receiver 
 	return out
 }
 
-func allowedReceiver(receiver Receiver) bool {
-	return receiver.name == "102" || receiver.name == "EXIMBANK"
-}
-
 type MessagesFile struct {
 	receiver Receiver
 	filepath string
@@ -115,14 +116,14 @@ func messagesFiles(ctx context.Context, in <-chan Receiver) <-chan MessagesFile 
 	return out
 }
 
-type Message struct {
+type RawMessage struct {
 	receiver  Receiver
 	timestamp string
 	body      string
 }
 
-func parsedMessages(ctx context.Context, in <-chan MessagesFile) <-chan Message {
-	out := make(chan Message)
+func rawMessagesFromDisk(ctx context.Context, in <-chan MessagesFile) <-chan RawMessage {
+	out := make(chan RawMessage)
 
 	go func() {
 		defer close(out)
@@ -141,7 +142,7 @@ func parsedMessages(ctx context.Context, in <-chan MessagesFile) <-chan Message 
 				}
 				timestamp := strings.TrimSpace(m[1])
 				body := strings.Join(strings.Fields(strings.TrimSpace(m[2])), " ")
-				message := Message{receiver: mf.receiver, timestamp: timestamp, body: body}
+				message := RawMessage{receiver: mf.receiver, timestamp: timestamp, body: body}
 				select {
 				case out <- message:
 				case <-ctx.Done():
@@ -153,4 +154,78 @@ func parsedMessages(ctx context.Context, in <-chan MessagesFile) <-chan Message 
 	}()
 
 	return out
+}
+
+type Message struct {
+	RawMessage
+	operation_type string
+	account        string
+	amount         string
+	location       string
+}
+
+func parsedMessages(ctx context.Context, in <-chan RawMessage) <-chan Message {
+	out := make(chan Message)
+
+	go func() {
+		defer close(out)
+		for rm := range in {
+			var msg Message
+			if rm.receiver.name == "102" {
+				msg = parseMaibMessage(rm)
+			} else if rm.receiver.name == "EXIMBANK" {
+				msg = parseEximMessage(rm)
+			}
+
+			if msg.amount == "" {
+				continue
+			}
+
+			msg.receiver = rm.receiver
+			msg.timestamp = rm.timestamp
+			msg.body = rm.body
+
+			select {
+			case out <- msg:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	return out
+}
+
+func parseMaibMessage(rm RawMessage) Message {
+	var msg Message
+	pattern := regexp.MustCompile(`Op: (.+) Karta: (.+) Status: (.+) Summa: (.+) Dost: (.+) Data/vremya: (.+) Adres: (.+)`)
+	matches := pattern.FindStringSubmatch(rm.body)
+
+	if len(matches) < 7 {
+		return msg
+	}
+
+	msg.operation_type = matches[1]
+	msg.account = matches[2]
+	msg.amount = matches[4]
+	msg.location = matches[7]
+
+	return msg
+}
+
+func parseEximMessage(rm RawMessage) Message {
+	var msg Message
+	pattern := regexp.MustCompile(`Tranzactie reusita, Data (.+), Card (.+), Suma (.+), Locatie (.+) Disponibil (.+)`)
+	matches := pattern.FindStringSubmatch(rm.body)
+
+	if len(matches) < 5 {
+		return msg
+	}
+
+	msg.operation_type = "Tranzactie reusita"
+	msg.account = matches[2]
+	msg.amount = matches[3]
+	msg.location = strings.TrimSuffix(strings.TrimSpace(matches[4]), ",")
+
+	return msg
 }
