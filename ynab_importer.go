@@ -2,32 +2,42 @@ package main
 
 import (
 	"context"
+	"encoding/csv"
 	"fmt"
 	"log"
 	"os"
 	"path"
 	"regexp"
+	"strconv"
 	"strings"
+	"time"
 )
 
 func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	r := receiversFromDisk(ctx)
-	fr := filteredReceivers(ctx, r)
-	mf := messagesFiles(ctx, fr)
+	mf := messagesFiles(ctx, r)
 	rm := rawMessagesFromDisk(ctx, mf)
-	out := parsedMessages(ctx, rm)
+	pm := parsedMessages(ctx, rm)
+	fc := filteredChannel(ctx, pm, func(msg Message) bool {
+		val, err := strconv.ParseFloat(msg.amount.value, 64)
+		return err != nil || val <= 0 || msg.timestamp.Before(startTimestamp)
+	})
 
-	for v := range out {
-		fmt.Println(v.operation_type, v.account, v.amount, v.location)
-	}
+	outputCsv(fc)
+
+	// for v := range out {
+	// 	fmt.Println(v.timestamp, v.operation_type, v.account, v.direction, v.amount, v.location, v.memo)
+	// }
 }
+
+var startTimestamp = time.Date(2024, 8, 1, 0, 0, 0, 0, time.UTC)
 
 const receiversPath = "./messages"
 
 func allowedReceiver(receiver Receiver) bool {
-	return receiver.name == "102" // || receiver.name == "EXIMBANK"
+	return receiver.name == "EXIMBANK" // || receiver.name == "102"
 }
 
 type Receiver struct {
@@ -52,23 +62,6 @@ func receiversFromDisk(ctx context.Context) <-chan Receiver {
 			if !allowedReceiver(receiver) {
 				continue
 			}
-			select {
-			case out <- receiver:
-			case <-ctx.Done():
-				return
-			}
-		}
-	}()
-
-	return out
-}
-
-func filteredReceivers(ctx context.Context, in <-chan Receiver) <-chan Receiver {
-	out := make(chan Receiver)
-
-	go func() {
-		defer close(out)
-		for receiver := range in {
 			select {
 			case out <- receiver:
 			case <-ctx.Done():
@@ -118,7 +111,7 @@ func messagesFiles(ctx context.Context, in <-chan Receiver) <-chan MessagesFile 
 
 type RawMessage struct {
 	receiver  Receiver
-	timestamp string
+	timestamp time.Time
 	body      string
 }
 
@@ -140,7 +133,7 @@ func rawMessagesFromDisk(ctx context.Context, in <-chan MessagesFile) <-chan Raw
 				if len(m) != 3 {
 					continue
 				}
-				timestamp := strings.TrimSpace(m[1])
+				timestamp := parseTime(m[1])
 				body := strings.Join(strings.Fields(strings.TrimSpace(m[2])), " ")
 				message := RawMessage{receiver: mf.receiver, timestamp: timestamp, body: body}
 				select {
@@ -156,12 +149,43 @@ func rawMessagesFromDisk(ctx context.Context, in <-chan MessagesFile) <-chan Raw
 	return out
 }
 
+func parseTime(timestamp string) time.Time {
+	parsed_timestamp, err := time.Parse("2006-01-02 15:04:05 MST", strings.TrimSpace(timestamp)+" EEST")
+	if err != nil {
+		panic(err)
+	}
+
+	return parsed_timestamp
+}
+
+type Currency struct {
+	value    string
+	currency string
+}
+
+func parseCurrency(amount string) Currency {
+	parts := strings.Fields(strings.TrimSpace(amount))
+
+	return Currency{parts[0], parts[1]}
+}
+
 type Message struct {
 	RawMessage
 	operation_type string
+	direction      string
 	account        string
-	amount         string
+	amount         Currency
 	location       string
+	memo           string
+}
+
+func (msg Message) toCsv() []string {
+	csv := make([]string, 4)
+	csv[0] = msg.timestamp.Format("2006-01-02")
+	csv[1] = msg.location
+	csv[2] = msg.memo
+	csv[3] = fmt.Sprintf("%s%s", msg.direction, msg.amount.value)
+	return csv
 }
 
 func parsedMessages(ctx context.Context, in <-chan RawMessage) <-chan Message {
@@ -171,13 +195,15 @@ func parsedMessages(ctx context.Context, in <-chan RawMessage) <-chan Message {
 		defer close(out)
 		for rm := range in {
 			var msg Message
-			if rm.receiver.name == "102" {
+
+			switch rm.receiver.name {
+			case "102":
 				msg = parseMaibMessage(rm)
-			} else if rm.receiver.name == "EXIMBANK" {
+			case "EXIMBANK":
 				msg = parseEximMessage(rm)
 			}
 
-			if msg.amount == "" {
+			if msg.operation_type == "" {
 				continue
 			}
 
@@ -207,25 +233,107 @@ func parseMaibMessage(rm RawMessage) Message {
 
 	msg.operation_type = matches[1]
 	msg.account = matches[2]
-	msg.amount = matches[4]
+	msg.amount = parseCurrency(matches[4])
 	msg.location = matches[7]
 
 	return msg
 }
 
-func parseEximMessage(rm RawMessage) Message {
+func parseEximSpending(rm RawMessage) Message {
 	var msg Message
-	pattern := regexp.MustCompile(`Tranzactie reusita, Data (.+), Card (.+), Suma (.+), Locatie (.+) Disponibil (.+)`)
+	pattern := regexp.MustCompile(`(Tranzactie reusita|Anulare tranzactie), Data (.+), Card (.+), Suma (.+), Locatie (.+) Disponibil (.+)`)
+	matches := pattern.FindStringSubmatch(rm.body)
+
+	if len(matches) < 6 {
+		return msg
+	}
+
+	msg.operation_type = matches[1]
+	msg.direction = parseDirectionFromEximOperationType(msg.operation_type)
+	msg.account = matches[3]
+	msg.amount = parseCurrency(matches[4])
+	msg.location = strings.TrimSuffix(strings.TrimSpace(matches[5]), ",")
+
+	return msg
+}
+
+func parseEximTopup(rm RawMessage) Message {
+	var msg Message
+	pattern := regexp.MustCompile(`(Suplinire cont) Card (.+), Data (.+), Suma (.+), Detalii (.+), Disponibil (.+)`)
 	matches := pattern.FindStringSubmatch(rm.body)
 
 	if len(matches) < 5 {
 		return msg
 	}
 
-	msg.operation_type = "Tranzactie reusita"
+	msg.operation_type = matches[1]
+	msg.direction = parseDirectionFromEximOperationType(msg.operation_type)
 	msg.account = matches[2]
-	msg.amount = matches[3]
-	msg.location = strings.TrimSuffix(strings.TrimSpace(matches[4]), ",")
+	msg.amount = parseCurrency(matches[4])
+	msg.memo = strings.TrimSuffix(strings.TrimSpace(matches[5]), ",")
 
 	return msg
+}
+
+func parseEximMessage(rm RawMessage) Message {
+	msg := parseEximSpending(rm)
+	if msg.account == "" {
+		msg = parseEximTopup(rm)
+	}
+	return msg
+}
+
+func parseDirectionFromEximOperationType(operation_type string) string {
+	switch operation_type {
+	case "Tranzactie reusita":
+		return "-"
+	case "Anulare tranzactie":
+		return "+"
+	case "Suplinire cont":
+		return "+"
+	}
+
+	return ""
+}
+
+func filteredChannel[T any](ctx context.Context, in <-chan T, fn func(T) bool) (out chan T) {
+	out = make(chan T)
+
+	go func() {
+		defer close(out)
+		for msg := range in {
+
+			if fn(msg) {
+				continue
+			}
+
+			select {
+			case out <- msg:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	return out
+}
+
+func outputCsv(in <-chan Message) {
+	w := csv.NewWriter(os.Stdout)
+	defer w.Flush()
+
+	err := w.Write([]string{"Date", "Payee", "Memo", "Amount"})
+	if err != nil {
+		log.Fatal(err)
+		return
+	}
+
+	for msg := range in {
+		// fmt.Println(msg.timestamp, msg.operation_type, msg.account, msg.direction, msg.amount, msg.location, msg.memo)
+		err := w.Write(msg.toCsv())
+		if err != nil {
+			log.Fatal(err)
+			return
+		}
+	}
 }
