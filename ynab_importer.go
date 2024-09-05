@@ -1,10 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/csv"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"path"
 	"regexp"
@@ -26,57 +28,6 @@ func main() {
 	})
 
 	splitPerAccount(ctx, fc)
-}
-
-func splitPerAccount(ctx context.Context, in <-chan Message) {
-	var wg sync.WaitGroup
-	wg.Add(3)
-	ch1 := make(chan Message)
-	ch2 := make(chan Message)
-	ch3 := make(chan Message)
-
-	go func() {
-		defer close(ch1)
-		defer close(ch2)
-		defer close(ch3)
-		for msg := range in {
-			switch msg.account {
-			case "*1972":
-				select {
-				case ch1 <- msg:
-				case <-ctx.Done():
-					return
-				}
-			case "*3632":
-				fallthrough
-			case "*2571":
-				select {
-				case ch2 <- msg:
-				case <-ctx.Done():
-					return
-				}
-			case "4..6345":
-				select {
-				case ch3 <- msg:
-				case <-ctx.Done():
-					return
-				}
-			default:
-				panic(fmt.Sprintf("Unknown account: %s", msg.account))
-			}
-		}
-	}()
-
-	output := func(ch <-chan Message) {
-		outputCsv(ch)
-		wg.Done()
-	}
-
-	go output(ch1)
-	go output(ch2)
-	go output(ch3)
-
-	wg.Wait()
 }
 
 var rates = map[string]float64{
@@ -253,6 +204,33 @@ func (msg Message) toCsv() []string {
 	return csv
 }
 
+func (msg Message) toJson(account_id string) string {
+	value := msg.amount.value
+	if msg.direction == "-" {
+		value *= -1
+	}
+	converted_value := int64(value * 1000)
+
+	return strings.TrimSpace(strings.Join(strings.Fields(fmt.Sprintf(`{
+      "date":"%s", 
+      "amount": %d, 
+      "account_id": "%s",
+      "payee_id": null,
+      "category_id": null,
+      "cleared": null,
+      "approved": true,
+      "flag_color": null,
+      "payee_name": "%s",
+      "memo": "%s"
+      }`,
+		msg.timestamp.Format("2006-01-02"),
+		converted_value,
+		account_id,
+		msg.location,
+		msg.memo,
+	)), ""))
+}
+
 func parsedMessages(ctx context.Context, in <-chan RawMessage) <-chan Message {
 	out := make(chan Message)
 
@@ -302,6 +280,9 @@ func parseMaibMessage(rm RawMessage) Message {
 	msg.account = matches[2]
 	msg.amount = parseCurrency(matches[4])
 	msg.location = parseMaibLocation(matches[7])
+	if msg.location == "" {
+		msg.location = "MAIB"
+	}
 
 	return msg
 }
@@ -328,6 +309,9 @@ func parseEximSpending(rm RawMessage) Message {
 	msg.account = matches[3]
 	msg.amount = parseCurrency(matches[4])
 	msg.location = strings.TrimSuffix(strings.TrimSpace(matches[5]), ",")
+	if msg.location == "" {
+		msg.location = "EXIMBANK"
+	}
 
 	return msg
 }
@@ -346,6 +330,9 @@ func parseEximTopup(rm RawMessage) Message {
 	msg.account = matches[2]
 	msg.amount = parseCurrency(matches[4])
 	msg.memo = strings.TrimSuffix(strings.TrimSpace(matches[5]), ",")
+	if msg.location == "" {
+		msg.location = "EXIMBANK"
+	}
 
 	return msg
 }
@@ -420,4 +407,78 @@ func outputCsv(in <-chan Message) {
 			return
 		}
 	}
+}
+
+func outputApi(in <-chan Message, budget_id, account_id string) {
+	for msg := range in {
+		sendYnabTransaction(msg.toJson(account_id), budget_id)
+	}
+}
+
+func sendYnabTransaction(json string, budget_id string) {
+	client := &http.Client{}
+	url := fmt.Sprintf("https://api.ynab.com/v1/budgets/%s/transactions", budget_id)
+	msgs := fmt.Sprintf(`{"transaction":%s}`, json)
+	req, err := http.NewRequest("POST", url, bytes.NewBuffer([]byte(msgs)))
+	req.Header.Set("Authorization", "Bearer "+os.Getenv("TOKEN"))
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		panic(err)
+	}
+	defer resp.Body.Close()
+}
+
+func splitPerAccount(ctx context.Context, in <-chan Message) {
+	var wg sync.WaitGroup
+	wg.Add(3)
+	ch1 := make(chan Message)
+	ch2 := make(chan Message)
+	ch3 := make(chan Message)
+
+	go func() {
+		defer close(ch1)
+		defer close(ch2)
+		defer close(ch3)
+		for msg := range in {
+			switch msg.account {
+			case "*1972":
+				select {
+				case ch1 <- msg:
+				case <-ctx.Done():
+					return
+				}
+			case "*3632":
+				fallthrough
+			case "*2571":
+				select {
+				case ch2 <- msg:
+				case <-ctx.Done():
+					return
+				}
+			case "4..6345":
+				select {
+				case ch3 <- msg:
+				case <-ctx.Done():
+					return
+				}
+			default:
+				panic(fmt.Sprintf("Unknown account: %s", msg.account))
+			}
+		}
+	}()
+
+	output := func(ch <-chan Message, budget_id, account_id string) {
+		outputApi(ch, budget_id, account_id)
+		wg.Done()
+	}
+
+	budget_id := "4f85f1ac-1bfe-4123-b3b9-e450bc6ed69e"
+
+	go output(ch1, budget_id, "fd6f626b-7564-42bf-80ee-75feb70fd002")
+	go output(ch2, budget_id, "76f338c8-b2d1-4edf-9a89-7331ebecc1bf")
+	go output(ch3, budget_id, "079f089b-ccbc-4d37-87eb-c4dd86e23af3")
+
+	wg.Wait()
 }
