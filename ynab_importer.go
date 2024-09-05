@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/csv"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -204,13 +205,22 @@ func (msg Message) toCsv() []string {
 	return csv
 }
 
-func (msg Message) toJson(account_id string) string {
+func (msg Message) fancyAmount() int64 {
 	value := msg.amount.value
 	if msg.direction == "-" {
 		value *= -1
 	}
-	converted_value := int64(value * 1000)
+	return int64(value * 1000)
+}
 
+func (msg Message) importId() string {
+	return fmt.Sprintf("A:%d:%s:%s",
+		msg.fancyAmount(),
+		strings.ReplaceAll(msg.timestamp.Format("20060102150405"), " ", ""),
+		msg.account)
+}
+
+func (msg Message) toJson(account_id string) string {
 	return strings.TrimSpace(strings.Join(strings.Fields(fmt.Sprintf(`{
       "date":"%s", 
       "amount": %d, 
@@ -221,14 +231,15 @@ func (msg Message) toJson(account_id string) string {
       "approved": true,
       "flag_color": null,
       "payee_name": "%s",
-      "memo": "%s"
+      "memo": "%s",
+      "import_id": "%s"
       }`,
 		msg.timestamp.Format("2006-01-02"),
-		converted_value,
+		msg.fancyAmount(),
 		account_id,
 		msg.location,
 		msg.memo,
-	)), ""))
+		msg.importId())), ""))
 }
 
 func parsedMessages(ctx context.Context, in <-chan RawMessage) <-chan Message {
@@ -428,6 +439,8 @@ func sendYnabTransaction(json string, budget_id string) {
 		panic(err)
 	}
 	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	fmt.Println("response Body:", string(body))
 }
 
 func splitPerAccount(ctx context.Context, in <-chan Message) {
