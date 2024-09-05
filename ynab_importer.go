@@ -34,6 +34,12 @@ func main() {
 	// }
 }
 
+var rates = map[string]float64{
+	"EUR": 19.80,
+	"USD": 17.80,
+	"BGN": 9.90,
+	"RON": 3.95,
+}
 var startTimestamp = time.Date(2024, 8, 1, 0, 0, 0, 0, time.UTC)
 
 const receiversPath = "./messages"
@@ -171,7 +177,15 @@ func parseCurrency(amount string) Currency {
 	if err != nil {
 		panic(err)
 	}
-	return Currency{value, parts[1]}
+	return exchangeToMdl(Currency{value, parts[1]})
+}
+
+func exchangeToMdl(amount Currency) Currency {
+	if amount.currency == "MDL" {
+		return amount
+	}
+
+	return Currency{amount.value * rates[amount.currency], "MDL"}
 }
 
 type Message struct {
