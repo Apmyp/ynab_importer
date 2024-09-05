@@ -21,11 +21,13 @@ func main() {
 	rm := rawMessagesFromDisk(ctx, mf)
 	pm := parsedMessages(ctx, rm)
 	fc := filteredChannel(ctx, pm, func(msg Message) bool {
-		val, err := strconv.ParseFloat(msg.amount.value, 64)
-		return err != nil || val <= 0 || msg.timestamp.Before(startTimestamp)
+		return msg.amount.value >= 0 && msg.timestamp.After(startTimestamp)
+	})
+	fc2 := filteredChannel(ctx, fc, func(msg Message) bool {
+		return true // msg.account == "*1972"
 	})
 
-	outputCsv(fc)
+	outputCsv(fc2)
 
 	// for v := range out {
 	// 	fmt.Println(v.timestamp, v.operation_type, v.account, v.direction, v.amount, v.location, v.memo)
@@ -37,7 +39,7 @@ var startTimestamp = time.Date(2024, 8, 1, 0, 0, 0, 0, time.UTC)
 const receiversPath = "./messages"
 
 func allowedReceiver(receiver Receiver) bool {
-	return receiver.name == "EXIMBANK" // || receiver.name == "102"
+	return receiver.name == "102" // || receiver.name == "EXIMBANK"
 }
 
 type Receiver struct {
@@ -159,14 +161,17 @@ func parseTime(timestamp string) time.Time {
 }
 
 type Currency struct {
-	value    string
+	value    float64
 	currency string
 }
 
 func parseCurrency(amount string) Currency {
 	parts := strings.Fields(strings.TrimSpace(amount))
-
-	return Currency{parts[0], parts[1]}
+	value, err := strconv.ParseFloat(strings.ReplaceAll(parts[0], ",", "."), 64)
+	if err != nil {
+		panic(err)
+	}
+	return Currency{value, parts[1]}
 }
 
 type Message struct {
@@ -177,6 +182,7 @@ type Message struct {
 	amount         Currency
 	location       string
 	memo           string
+	status         string
 }
 
 func (msg Message) toCsv() []string {
@@ -184,7 +190,7 @@ func (msg Message) toCsv() []string {
 	csv[0] = msg.timestamp.Format("2006-01-02")
 	csv[1] = msg.location
 	csv[2] = msg.memo
-	csv[3] = fmt.Sprintf("%s%s", msg.direction, msg.amount.value)
+	csv[3] = fmt.Sprintf("%s%.2f", msg.direction, msg.amount.value)
 	return csv
 }
 
@@ -232,11 +238,21 @@ func parseMaibMessage(rm RawMessage) Message {
 	}
 
 	msg.operation_type = matches[1]
+	msg.status = matches[3]
+	msg.direction = parseDirectionFromMaibMessage(msg)
 	msg.account = matches[2]
 	msg.amount = parseCurrency(matches[4])
-	msg.location = matches[7]
+	msg.location = parseMaibLocation(matches[7])
 
 	return msg
+}
+
+func parseMaibLocation(location string) string {
+	if index := strings.Index(location, "Podderzhka: +373"); index > -1 {
+		location = strings.TrimSpace(location[:index])
+	}
+
+	return location
 }
 
 func parseEximSpending(rm RawMessage) Message {
@@ -283,6 +299,14 @@ func parseEximMessage(rm RawMessage) Message {
 	return msg
 }
 
+func parseDirectionFromMaibMessage(msg Message) string {
+	if msg.operation_type == "Popolnenie" || msg.status == "Uspeshnoe reversirovanie" {
+		return "+"
+	}
+
+	return "-"
+}
+
 func parseDirectionFromEximOperationType(operation_type string) string {
 	switch operation_type {
 	case "Tranzactie reusita":
@@ -303,7 +327,7 @@ func filteredChannel[T any](ctx context.Context, in <-chan T, fn func(T) bool) (
 		defer close(out)
 		for msg := range in {
 
-			if fn(msg) {
+			if !fn(msg) {
 				continue
 			}
 
