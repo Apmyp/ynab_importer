@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -23,15 +24,59 @@ func main() {
 	fc := filteredChannel(ctx, pm, func(msg Message) bool {
 		return msg.amount.value >= 0 && msg.timestamp.After(startTimestamp)
 	})
-	fc2 := filteredChannel(ctx, fc, func(msg Message) bool {
-		return true // msg.account == "*1972"
-	})
 
-	outputCsv(fc2)
+	splitPerAccount(ctx, fc)
+}
 
-	// for v := range out {
-	// 	fmt.Println(v.timestamp, v.operation_type, v.account, v.direction, v.amount, v.location, v.memo)
-	// }
+func splitPerAccount(ctx context.Context, in <-chan Message) {
+	var wg sync.WaitGroup
+	wg.Add(3)
+	ch1 := make(chan Message)
+	ch2 := make(chan Message)
+	ch3 := make(chan Message)
+
+	go func() {
+		defer close(ch1)
+		defer close(ch2)
+		defer close(ch3)
+		for msg := range in {
+			switch msg.account {
+			case "*1972":
+				select {
+				case ch1 <- msg:
+				case <-ctx.Done():
+					return
+				}
+			case "*3632":
+				fallthrough
+			case "*2571":
+				select {
+				case ch2 <- msg:
+				case <-ctx.Done():
+					return
+				}
+			case "4..6345":
+				select {
+				case ch3 <- msg:
+				case <-ctx.Done():
+					return
+				}
+			default:
+				panic(fmt.Sprintf("Unknown account: %s", msg.account))
+			}
+		}
+	}()
+
+	output := func(ch <-chan Message) {
+		outputCsv(ch)
+		wg.Done()
+	}
+
+	go output(ch1)
+	go output(ch2)
+	go output(ch3)
+
+	wg.Wait()
 }
 
 var rates = map[string]float64{
@@ -40,12 +85,12 @@ var rates = map[string]float64{
 	"BGN": 9.90,
 	"RON": 3.95,
 }
-var startTimestamp = time.Date(2024, 8, 1, 0, 0, 0, 0, time.UTC)
+var startTimestamp = time.Date(2024, 9, 1, 0, 0, 0, 0, time.UTC)
 
 const receiversPath = "./messages"
 
 func allowedReceiver(receiver Receiver) bool {
-	return receiver.name == "102" // || receiver.name == "EXIMBANK"
+	return receiver.name == "102" || receiver.name == "EXIMBANK"
 }
 
 type Receiver struct {
@@ -289,7 +334,7 @@ func parseEximSpending(rm RawMessage) Message {
 
 func parseEximTopup(rm RawMessage) Message {
 	var msg Message
-	pattern := regexp.MustCompile(`(Suplinire cont) Card (.+), Data (.+), Suma (.+), Detalii (.+), Disponibil (.+)`)
+	pattern := regexp.MustCompile(`(Suplinire cont|Debitare cont) Card (.+), Data (.+), Suma (.+), Detalii (.+), Disponibil (.+)`)
 	matches := pattern.FindStringSubmatch(rm.body)
 
 	if len(matches) < 5 {
@@ -323,10 +368,12 @@ func parseDirectionFromMaibMessage(msg Message) string {
 
 func parseDirectionFromEximOperationType(operation_type string) string {
 	switch operation_type {
+	case "Debitare cont":
+		fallthrough
 	case "Tranzactie reusita":
 		return "-"
 	case "Anulare tranzactie":
-		return "+"
+		fallthrough
 	case "Suplinire cont":
 		return "+"
 	}
@@ -367,7 +414,6 @@ func outputCsv(in <-chan Message) {
 	}
 
 	for msg := range in {
-		// fmt.Println(msg.timestamp, msg.operation_type, msg.account, msg.direction, msg.amount, msg.location, msg.memo)
 		err := w.Write(msg.toCsv())
 		if err != nil {
 			log.Fatal(err)
