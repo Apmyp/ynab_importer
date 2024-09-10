@@ -25,7 +25,7 @@ func main() {
 	rm := rawMessagesFromDisk(ctx, mf)
 	pm := parsedMessages(ctx, rm)
 	fc := filteredChannel(ctx, pm, func(msg Message) bool {
-		return msg.amount.value >= 0 && msg.timestamp.After(startTimestamp)
+		return msg.amount.value > 0 && msg.timestamp.After(startTimestamp)
 	})
 
 	splitPerAccount(ctx, fc)
@@ -34,10 +34,10 @@ func main() {
 var rates = map[string]float64{
 	"EUR": 19.80,
 	"USD": 17.80,
-	"BGN": 9.90,
+	"BGN": 10.10,
 	"RON": 3.95,
 }
-var startTimestamp = time.Date(2024, 9, 1, 0, 0, 0, 0, time.UTC)
+var startTimestamp = time.Date(2024, 9, 7, 0, 0, 0, 0, time.UTC)
 
 const receiversPath = "./messages"
 
@@ -227,7 +227,7 @@ func (msg Message) toJson(account_id string) string {
       "account_id": "%s",
       "payee_id": null,
       "category_id": null,
-      "cleared": null,
+      "cleared": "cleared",
       "approved": true,
       "flag_color": null,
       "payee_name": "%s",
