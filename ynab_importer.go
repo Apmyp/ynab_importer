@@ -37,7 +37,7 @@ var rates = map[string]float64{
 	"BGN": 10.10,
 	"RON": 3.95,
 }
-var startTimestamp = time.Date(2024, 9, 7, 0, 0, 0, 0, time.UTC)
+var startTimestamp = time.Date(2024, 9, 11, 0, 0, 0, 0, time.UTC)
 
 const receiversPath = "./messages"
 
@@ -174,7 +174,7 @@ func parseCurrency(amount string) Currency {
 	if err != nil {
 		panic(err)
 	}
-	return exchangeToMdl(Currency{value, parts[1]})
+	return Currency{value, parts[1]}
 }
 
 func exchangeToMdl(amount Currency) Currency {
@@ -187,13 +187,14 @@ func exchangeToMdl(amount Currency) Currency {
 
 type Message struct {
 	RawMessage
-	operation_type string
-	direction      string
-	account        string
-	amount         Currency
-	location       string
-	memo           string
-	status         string
+	operation_type  string
+	direction       string
+	account         string
+	original_amount Currency
+	amount          Currency
+	location        string
+	memo            string
+	status          string
 }
 
 func (msg Message) toCsv() []string {
@@ -213,9 +214,17 @@ func (msg Message) fancyAmount() int64 {
 	return int64(value * 1000)
 }
 
+func (msg Message) fancyOriginalAmount() int64 {
+	value := msg.original_amount.value
+	if msg.direction == "-" {
+		value *= -1
+	}
+	return int64(value * 1000)
+}
+
 func (msg Message) importId() string {
 	return fmt.Sprintf("A:%d:%s:%s",
-		msg.fancyAmount(),
+		msg.fancyOriginalAmount(),
 		strings.ReplaceAll(msg.timestamp.Format("20060102150405"), " ", ""),
 		msg.account)
 }
@@ -289,7 +298,8 @@ func parseMaibMessage(rm RawMessage) Message {
 	msg.status = matches[3]
 	msg.direction = parseDirectionFromMaibMessage(msg)
 	msg.account = matches[2]
-	msg.amount = parseCurrency(matches[4])
+	msg.original_amount = parseCurrency(matches[4])
+	msg.amount = exchangeToMdl(parseCurrency(matches[4]))
 	msg.location = parseMaibLocation(matches[7])
 	if msg.location == "" {
 		msg.location = "MAIB"
@@ -318,7 +328,8 @@ func parseEximSpending(rm RawMessage) Message {
 	msg.operation_type = matches[1]
 	msg.direction = parseDirectionFromEximOperationType(msg.operation_type)
 	msg.account = matches[3]
-	msg.amount = parseCurrency(matches[4])
+	msg.original_amount = parseCurrency(matches[4])
+	msg.amount = exchangeToMdl(parseCurrency(matches[4]))
 	msg.location = strings.TrimSuffix(strings.TrimSpace(matches[5]), ",")
 	if msg.location == "" {
 		msg.location = "EXIMBANK"
