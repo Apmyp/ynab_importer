@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/csv"
@@ -20,15 +21,20 @@ import (
 func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	db := &DB{dbPath: dbPath}
+	db.Load()
+	defer db.Unload()
+
 	r := receiversFromDisk(ctx)
 	mf := messagesFiles(ctx, r)
 	rm := rawMessagesFromDisk(ctx, mf)
 	pm := parsedMessages(ctx, rm)
 	fc := filteredChannel(ctx, pm, func(msg Message) bool {
-		return msg.amount.value > 0 && msg.timestamp.After(startTimestamp)
+		return msg.amount.value > 0 && msg.timestamp.After(startTimestamp) && !db.IsImported(msg.importId())
 	})
 
-	splitPerAccount(ctx, fc)
+	splitPerAccount(ctx, fc, db)
 }
 
 var rates = map[string]float64{
@@ -39,12 +45,62 @@ var rates = map[string]float64{
 	"GBP": 23.78,
 	"AMD": 0.062,
 }
-var startTimestamp = time.Date(2024, 10, 10, 0, 0, 0, 0, time.UTC)
+var startTimestamp = time.Date(2024, 10, 01, 0, 0, 0, 0, time.UTC)
 
-const receiversPath = "./messages"
+const (
+	dbPath        = "./transactions.txt"
+	receiversPath = "./messages"
+)
 
 func allowedReceiver(receiver Receiver) bool {
 	return receiver.name == "102" || receiver.name == "EXIMBANK"
+}
+
+type DB struct {
+	dbPath       string
+	transactions map[string]struct{}
+	file         *os.File
+}
+
+func (db *DB) Load() {
+	file, err := os.OpenFile(db.dbPath, os.O_CREATE|os.O_RDWR, 0644)
+	if err != nil {
+		panic(err)
+	}
+
+	lines := make(map[string]struct{})
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		lines[scanner.Text()] = struct{}{}
+	}
+
+	if err := scanner.Err(); err != nil {
+		panic(err)
+	}
+
+	db.file = file
+	db.transactions = lines
+}
+
+func (db *DB) Unload() {
+	defer db.file.Close()
+}
+
+func (db *DB) IsImported(importId string) bool {
+	_, ok := db.transactions[importId]
+
+	return ok
+}
+
+func (db *DB) AddTransaction(importId string) {
+	w := bufio.NewWriter(db.file)
+	_, err := w.WriteString(fmt.Sprintf("%s\n", importId))
+	if err != nil {
+		panic(err)
+	}
+
+	w.Flush()
+	db.transactions[importId] = struct{}{}
 }
 
 type Receiver struct {
@@ -216,6 +272,10 @@ func (msg Message) fancyAmount() int64 {
 	return int64(value * 1000)
 }
 
+func (msg Message) fancyLocation() string {
+	return strings.ReplaceAll(msg.location, "\"", "\\\"")
+}
+
 func (msg Message) fancyOriginalAmount() int64 {
 	value := msg.original_amount.value
 	if msg.direction == "-" {
@@ -248,7 +308,7 @@ func (msg Message) toJson(account_id string) string {
 		msg.timestamp.Format("2006-01-02"),
 		msg.fancyAmount(),
 		account_id,
-		msg.location,
+		msg.fancyLocation(),
 		msg.memo,
 		msg.importId())), ""))
 }
@@ -433,13 +493,17 @@ func outputCsv(in <-chan Message) {
 	}
 }
 
-func outputApi(in <-chan Message, budget_id, account_id string) {
+func outputApi(in <-chan Message, db *DB, budget_id, account_id string) {
 	for msg := range in {
-		sendYnabTransaction(msg.toJson(account_id), budget_id)
+		statusCode := sendYnabTransaction(msg.toJson(account_id), budget_id)
+
+		if statusCode == 200 || statusCode == 201 || statusCode == 409 {
+			db.AddTransaction(msg.importId())
+		}
 	}
 }
 
-func sendYnabTransaction(json string, budget_id string) {
+func sendYnabTransaction(json string, budget_id string) int {
 	client := &http.Client{}
 	url := fmt.Sprintf("https://api.ynab.com/v1/budgets/%s/transactions", budget_id)
 	msgs := fmt.Sprintf(`{"transaction":%s}`, json)
@@ -453,10 +517,16 @@ func sendYnabTransaction(json string, budget_id string) {
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
-	fmt.Println("response Body:", string(body))
+
+	statusCode := resp.StatusCode
+	if statusCode != 200 && statusCode != 201 && statusCode != 409 {
+		fmt.Println("Request:", msgs, "\n", "response Status:", resp.StatusCode, "Body:", string(body), "\n")
+	}
+
+	return statusCode
 }
 
-func splitPerAccount(ctx context.Context, in <-chan Message) {
+func splitPerAccount(ctx context.Context, in <-chan Message, db *DB) {
 	var wg sync.WaitGroup
 	wg.Add(3)
 	ch1 := make(chan Message)
@@ -496,7 +566,7 @@ func splitPerAccount(ctx context.Context, in <-chan Message) {
 	}()
 
 	output := func(ch <-chan Message, budget_id, account_id string) {
-		outputApi(ch, budget_id, account_id)
+		outputApi(ch, db, budget_id, account_id)
 		wg.Done()
 	}
 
