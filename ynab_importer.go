@@ -33,13 +33,13 @@ func main() {
 
 var rates = map[string]float64{
 	"EUR": 19.80,
-	"USD": 17.80,
+	"USD": 17.99,
 	"BGN": 10.10,
 	"RON": 3.95,
 	"GBP": 23.78,
 	"AMD": 0.062,
 }
-var startTimestamp = time.Date(2024, 9, 27, 0, 0, 0, 0, time.UTC)
+var startTimestamp = time.Date(2024, 10, 17, 0, 0, 0, 0, time.UTC)
 
 const receiversPath = "./messages"
 
