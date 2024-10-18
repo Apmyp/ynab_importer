@@ -39,7 +39,7 @@ var rates = map[string]float64{
 	"GBP": 23.78,
 	"AMD": 0.062,
 }
-var startTimestamp = time.Date(2024, 10, 17, 0, 0, 0, 0, time.UTC)
+var startTimestamp = time.Date(2024, 10, 10, 0, 0, 0, 0, time.UTC)
 
 const receiversPath = "./messages"
 
